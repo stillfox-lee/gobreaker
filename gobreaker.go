@@ -105,20 +105,20 @@ func (c *Counts) clear() {
 // If IsSuccessful is nil, default IsSuccessful is used, which returns false for all non-nil errors.
 type Settings struct {
 	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
+	MaxRequests   uint32                                  // 断路器 half-open 状态下最大允许发送的请求，最小为 1.
+	Interval      time.Duration                           // closed
+	Timeout       time.Duration                           // open 状态下的一个时间周期，周期内，不允许 execute，周期外切换为 half-open。
+	ReadyToTrip   func(counts Counts) bool                // 给用户自定义打开断路器的判断逻辑
+	OnStateChange func(name string, from State, to State) // 提供一个 callback，让外部调用者知道状态变更。
+	IsSuccessful  func(err error) bool                    // 一个 hook, 让外部调用者来判断 execute 获得的 error 要判定为成功或者失败。（关系到断路器的状态机）
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker struct {
 	name          string
 	maxRequests   uint32
-	interval      time.Duration
-	timeout       time.Duration
+	interval      time.Duration // default=0
+	timeout       time.Duration // default=60s
 	readyToTrip   func(counts Counts) bool
 	isSuccessful  func(err error) bool
 	onStateChange func(name string, from State, to State)
@@ -127,7 +127,7 @@ type CircuitBreaker struct {
 	state      State
 	generation uint64
 	counts     Counts
-	expiry     time.Time
+	expiry     time.Time // open 状态：expiry=now+timeout; closed 状态: expiry=now+interval; half-opne: expiry=0
 }
 
 // TwoStepCircuitBreaker is like CircuitBreaker but instead of surrounding a function
@@ -138,6 +138,7 @@ type TwoStepCircuitBreaker struct {
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
+// 默认状态是 closed
 func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	cb := new(CircuitBreaker)
 
@@ -189,6 +190,7 @@ func NewTwoStepCircuitBreaker(st Settings) *TwoStepCircuitBreaker {
 const defaultInterval = time.Duration(0) * time.Second
 const defaultTimeout = time.Duration(60) * time.Second
 
+// defaultReadyToTrip 如果累积 5 次失败，则打开断路器
 func defaultReadyToTrip(counts Counts) bool {
 	return counts.ConsecutiveFailures > 5
 }
@@ -226,6 +228,7 @@ func (cb *CircuitBreaker) Counts() Counts {
 // If a panic occurs in the request, the CircuitBreaker handles it as an error
 // and causes the same panic again.
 func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error) {
+	// 先对断路器状态进行判断，如果不允许发送request，则返回错误。
 	generation, err := cb.beforeRequest()
 	if err != nil {
 		return nil, err
@@ -273,6 +276,7 @@ func (tscb *TwoStepCircuitBreaker) Allow() (done func(success bool), err error) 
 	}, nil
 }
 
+// beforeRequest 根据断路器状态，判定是否允许发送这个请求
 func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -331,9 +335,11 @@ func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 	}
 }
 
+// currentState 有副作用。负责判断是否需要开启新周期，并且切换状态
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
 	case StateClosed:
+		// 每个 Execute 都会调用这个函数，意味着在 closed 状态下，expire 之前都会重置 counter。
 		if !cb.expiry.IsZero() && cb.expiry.Before(now) {
 			cb.toNewGeneration(now)
 		}
