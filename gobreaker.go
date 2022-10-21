@@ -344,6 +344,7 @@ func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 			cb.toNewGeneration(now)
 		}
 	case StateOpen:
+		// 超过了 Timeout 指定的时间，切换到 half-open 状态。但是不重置 counter。
 		if cb.expiry.Before(now) {
 			cb.setState(StateHalfOpen, now)
 		}
